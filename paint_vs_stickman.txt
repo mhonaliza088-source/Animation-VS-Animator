@@ -1,0 +1,1593 @@
+--========================================================================
+--  PAINT vs STICKMAN  (3D PC desktop)  -  Roblox LocalScript
+--  Run with Delta. Works on mobile (touch) and PC (mouse).
+--
+--  CONTROLS
+--   * Mobile: drag your finger = move the mouse cursor, tap = click.
+--   * PC: move the mouse = move the cursor, click = click.
+--   * Tap an app icon on the desktop. Paint starts the game.
+--   * Pencil: draw a stickman. Select: tap your drawing -> popup:
+--       "Put As Symbol" (brings him to life) or "Delete".
+--   * Swipe / move the cursor over him to hit him.
+--   * Anvil tool: tap to drop an anvil. Font tool: tap to place a damaging font.
+--   * He fights back with Brush (black puddles + paints himself),
+--     Pencil (darts), Bucket (paint splashes) and Eraser (sweeping bar).
+--   * The window X is locked for 30s after he wakes up. After that, press X,
+--     and the "Save Changes To Untitled 1?" box only lets you press NO.
+--   * Emergency exit: tap the Start button (bottom-left) 5 times fast.
+--========================================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- remove an older copy if the script is executed twice
+if _G.__PAINT_STICK and type(_G.__PAINT_STICK.destroy) == "function" then
+	pcall(_G.__PAINT_STICK.destroy)
+end
+_G.__PAINT_STICK = nil
+
+local conns = {}
+local function bind(sig, fn)
+	local c = sig:Connect(fn)
+	table.insert(conns, c)
+	return c
+end
+
+----------------------------------------------------------------------
+-- saved state (restored when the game ends)
+----------------------------------------------------------------------
+local oldType, oldFov, oldCF = cam.CameraType, cam.FieldOfView, cam.CFrame
+local oldIcon = UIS.MouseIconEnabled
+local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+local oldWS, oldJP, oldJH
+if hum then
+	oldWS, oldJP, oldJH = hum.WalkSpeed, hum.JumpPower, hum.JumpHeight
+	pcall(function()
+		hum.WalkSpeed = 0
+		hum.JumpPower = 0
+		hum.JumpHeight = 0
+	end)
+end
+
+----------------------------------------------------------------------
+-- gui used only to capture touch / mouse input
+----------------------------------------------------------------------
+local root = Instance.new("Folder")
+root.Name = "PC_SCREEN_3D"
+root.Parent = workspace
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "PC_SCREEN_INPUT"
+gui.IgnoreGuiInset = true
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 2147483647
+local okp = pcall(function()
+	gui.Parent = (gethui and gethui()) or lp:WaitForChild("PlayerGui")
+end)
+if not okp or not gui.Parent then
+	gui.Parent = lp:WaitForChild("PlayerGui")
+end
+
+local capture = Instance.new("TextButton")
+capture.Size = UDim2.fromScale(1, 1)
+capture.BackgroundTransparency = 1
+capture.Text = ""
+capture.AutoButtonColor = false
+capture.Active = true
+capture.Parent = gui
+
+local t0 = os.clock()
+while capture.AbsoluteSize.X <= 0 and os.clock() - t0 < 2 do
+	task.wait()
+end
+local scrSize = capture.AbsoluteSize
+if scrSize.X <= 0 then
+	scrSize = cam.ViewportSize
+end
+
+----------------------------------------------------------------------
+-- virtual screen: W x H "pixels" mapped onto a flat wall of 3D parts
+-- that sits right in front of the camera (far up in the sky)
+----------------------------------------------------------------------
+local W = 1000
+local H = W * scrSize.Y / scrSize.X
+local FOV = 70
+local s = 0.2 -- studs per virtual pixel
+local D = (H * s / 2) / math.tan(math.rad(FOV / 2))
+local BASE = Vector3.new(0, 5000, 0)
+local camCF = CFrame.new(BASE + Vector3.new(0, 0, D))
+
+cam.CameraType = Enum.CameraType.Scriptable
+cam.FieldOfView = FOV
+cam.CFrame = camCF
+UIS.MouseIconEnabled = false
+
+bind(RunService.RenderStepped, function()
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.FieldOfView = FOV
+	cam.CFrame = camCF
+	cam.Focus = camCF
+end)
+
+-- layers (distance toward the camera)
+local Z_BG, Z_ICON, Z_TASK, Z_WIN, Z_CANVAS = 0, 0.3, 0.5, 1.0, 1.3
+local Z_DRAW, Z_OBJ, Z_STICK, Z_POP, Z_DIM, Z_DLG, Z_CUR = 1.5, 1.8, 2.1, 3.0, 3.6, 3.8, 4.6
+
+----------------------------------------------------------------------
+-- state
+----------------------------------------------------------------------
+local S = {
+	cx = W / 2, cy = H / 2, tool = "pencil",
+	strokes = {}, darts = {}, puddles = {}, anvils = {}, fonts = {}, items = {},
+	curHP = 100, curHurt = 0, curInv = 0, crashT = 0, sinceHit = 99,
+	lockLeft = 30, xFlash = 0, lastAnvil = 0, toolBtns = {}, lastClock = 0,
+	down = false,
+}
+
+----------------------------------------------------------------------
+-- 3D part helpers
+----------------------------------------------------------------------
+local function wpos(vx, vy, z)
+	local k = (D - z) / D
+	return BASE + Vector3.new((vx - W / 2) * s * k, -(vy - H / 2) * s * k, z)
+end
+
+local function raw(color, transp, parent, shape)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.CastShadow = false
+	p.Material = Enum.Material.Neon
+	p.Color = color
+	p.Transparency = transp or 0
+	p.Size = Vector3.new(1, 1, 0.04)
+	if shape then
+		p.Shape = shape
+	end
+	p.Parent = parent or root
+	return p
+end
+
+local function place(p, x, y, w, h, z)
+	local k = (D - z) / D
+	p.Size = Vector3.new(math.max(w * s * k, 0.001), math.max(h * s * k, 0.001), 0.04)
+	p.CFrame = CFrame.new(wpos(x + w / 2, y + h / 2, z))
+end
+
+local function rect(x, y, w, h, z, color, transp, parent)
+	local p = raw(color, transp, parent)
+	place(p, x, y, w, h, z)
+	return p
+end
+
+local function ellipse(p, cx, cy, rx, ry, z)
+	local k = (D - z) / D
+	p.Size = Vector3.new(0.04, math.max(2 * ry * s * k, 0.001), math.max(2 * rx * s * k, 0.001))
+	p.CFrame = CFrame.new(wpos(cx, cy, z)) * CFrame.Angles(0, math.rad(90), 0)
+end
+
+local function mkEllipse(cx, cy, rx, ry, z, color, transp, parent)
+	local p = raw(color, transp, parent, Enum.PartType.Cylinder)
+	ellipse(p, cx, cy, rx, ry, z)
+	return p
+end
+
+local function lineSet(p, a, b, th, z)
+	local k = (D - z) / D
+	local wa, wb = wpos(a.X, a.Y, z), wpos(b.X, b.Y, z)
+	local dx, dy = wb.X - wa.X, wb.Y - wa.Y
+	local len = math.sqrt(dx * dx + dy * dy)
+	local t = th * s * k
+	p.Size = Vector3.new(len + t * 0.8, t, 0.04)
+	p.CFrame = CFrame.new((wa + wb) / 2) * CFrame.Angles(0, 0, math.atan2(dy, dx))
+end
+
+local function mkLine(a, b, th, z, color, parent)
+	local p = raw(color, 0, parent)
+	lineSet(p, a, b, th, z)
+	return p
+end
+
+local function addText(p, w, h, text, size, color, xa, font)
+	local sg = Instance.new("SurfaceGui")
+	sg.Face = Enum.NormalId.Back
+	sg.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+	sg.CanvasSize = Vector2.new(math.max(w * 2, 1), math.max(h * 2, 1))
+	sg.LightInfluence = 0
+	sg.Parent = p
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Size = UDim2.fromScale(1, 1)
+	t.Text = text
+	t.TextColor3 = color or Color3.new(0, 0, 0)
+	t.TextSize = math.clamp(math.floor(size * 2), 4, 100)
+	t.Font = font or Enum.Font.SourceSansBold
+	t.TextWrapped = true
+	t.TextXAlignment = xa or Enum.TextXAlignment.Center
+	t.TextYAlignment = Enum.TextYAlignment.Center
+	t.Parent = sg
+	return t
+end
+
+local function mkText(x, y, w, h, z, text, size, color, xa, parent, font)
+	local p = rect(x, y, w, h, z, Color3.new(1, 1, 1), 1, parent)
+	local lbl = addText(p, w, h, text, size, color, xa, font)
+	return p, lbl
+end
+
+----------------------------------------------------------------------
+-- button system (hit zones in virtual coordinates)
+----------------------------------------------------------------------
+local buttons = {}
+local hovered = nil
+
+local function removeGroup(g)
+	for i = #buttons, 1, -1 do
+		if buttons[i].group == g then
+			if hovered == buttons[i] then
+				hovered = nil
+			end
+			table.remove(buttons, i)
+		end
+	end
+end
+
+local function buttonAt(vx, vy)
+	local best
+	for _, b in ipairs(buttons) do
+		if b.enabled ~= false and (not S.modal or b.group == S.modal)
+			and vx >= b.x and vx <= b.x + b.w and vy >= b.y and vy <= b.y + b.h then
+			if not best or b.layer >= best.layer then
+				best = b
+			end
+		end
+	end
+	return best
+end
+
+local function refreshHover()
+	local b = buttonAt(S.cx, S.cy)
+	if b ~= hovered then
+		if hovered and hovered.hl and hovered.hl.Parent then
+			hovered.hl.Transparency = hovered.hlOff
+		end
+		hovered = b
+		if b and b.hl and b.hl.Parent then
+			b.hl.Transparency = b.hlOn
+		end
+	end
+end
+
+local function makeButton(o)
+	local bg = rect(o.x, o.y, o.w, o.h, o.z, o.bg or Color3.fromRGB(225, 225, 230), 0, o.parent)
+	local hl = rect(o.x, o.y, o.w, o.h, o.z + 0.05, o.hlColor or Color3.fromRGB(120, 180, 255), 1, o.parent)
+	local lbl
+	if o.text then
+		local _, l = mkText(o.x, o.y, o.w, o.h, o.z + 0.1, o.text, o.size or 11,
+			o.tc or Color3.new(0, 0, 0), nil, o.parent, o.font)
+		lbl = l
+	end
+	local b = {
+		group = o.group, x = o.x, y = o.y, w = o.w, h = o.h, layer = o.layer or 1,
+		onClick = o.onClick, hl = hl, hlOn = o.hlOn or 0.5, hlOff = 1, enabled = true,
+		bg = bg, label = lbl,
+	}
+	table.insert(buttons, b)
+	return b
+end
+
+----------------------------------------------------------------------
+-- forward declarations
+----------------------------------------------------------------------
+local closePaint, openPaint, showSaveDialog, destroyAll, hurtStick, hurtCursor
+local setHint, closePopup, updateGame, onPaintX, setTool, closeDummy, openDummy, openApp
+
+----------------------------------------------------------------------
+-- cursor (arrow made of lines)
+----------------------------------------------------------------------
+local cur = { out = {}, inn = {} }
+local CUR_E = {
+	{ Vector2.new(0, 0), Vector2.new(0, 18) },
+	{ Vector2.new(0, 0), Vector2.new(12, 13) },
+	{ Vector2.new(0, 18), Vector2.new(4, 14) },
+	{ Vector2.new(4, 14), Vector2.new(12, 13) },
+	{ Vector2.new(5, 14), Vector2.new(9, 21) },
+}
+
+local function buildCursor()
+	for i, e in ipairs(CUR_E) do
+		cur.out[i] = mkLine(e[1], e[2], 5, Z_CUR, Color3.new(0, 0, 0), root)
+		cur.inn[i] = mkLine(e[1], e[2], 2.4, Z_CUR + 0.15, Color3.new(1, 1, 1), root)
+	end
+end
+
+local function setCursor(vx, vy)
+	S.cx, S.cy = vx, vy
+	local o = Vector2.new(vx, vy)
+	for i, e in ipairs(CUR_E) do
+		lineSet(cur.out[i], o + e[1], o + e[2], 5, Z_CUR)
+		lineSet(cur.inn[i], o + e[1], o + e[2], 2.4, Z_CUR + 0.15)
+	end
+end
+
+----------------------------------------------------------------------
+-- desktop
+----------------------------------------------------------------------
+local APPS = {
+	{ name = "This PC", glyph = "🖥", col = Color3.fromRGB(80, 130, 200) },
+	{ name = "Recycle Bin", glyph = "🗑", col = Color3.fromRGB(160, 180, 200) },
+	{ name = "Paint", glyph = "🎨", col = Color3.fromRGB(255, 255, 255) },
+	{ name = "Google Chrome", glyph = "🌐", col = Color3.fromRGB(255, 255, 255) },
+	{ name = "Microsoft Word", glyph = "W", col = Color3.fromRGB(43, 87, 154), tc = Color3.new(1, 1, 1) },
+	{ name = "Microsoft Edge", glyph = "e", col = Color3.fromRGB(0, 150, 170), tc = Color3.new(1, 1, 1) },
+}
+
+local startTaps = {}
+
+local function buildDesktop()
+	local f = Instance.new("Folder")
+	f.Name = "Desktop"
+	f.Parent = root
+	rect(-60, -60, W + 120, H * 0.62 + 60, Z_BG, Color3.fromRGB(58, 126, 224), 0, f)
+	rect(-60, H * 0.62, W + 120, H * 0.38 + 60, Z_BG, Color3.fromRGB(70, 160, 64), 0, f)
+	mkEllipse(W * 0.3, H * 0.9, 560, 190, Z_BG + 0.05, Color3.fromRGB(88, 184, 72), 0, f)
+	mkEllipse(W * 0.8, H * 0.2, 80, 32, Z_BG + 0.05, Color3.fromRGB(255, 255, 255), 0.15, f)
+	mkEllipse(W * 0.86, H * 0.17, 55, 24, Z_BG + 0.05, Color3.fromRGB(255, 255, 255), 0.15, f)
+
+	-- taskbar
+	rect(0, H - 36, W, 36, Z_TASK, Color3.fromRGB(22, 22, 30), 0, f)
+	local sx, sy = 10, H - 28
+	for i = 0, 3 do
+		local ox, oy = (i % 2) * 11, math.floor(i / 2) * 11
+		rect(sx + ox, sy + oy, 9, 9, Z_TASK + 0.1, Color3.fromRGB(0, 140, 255), 0, f)
+	end
+	local startHl = rect(2, H - 36, 36, 36, Z_TASK + 0.05, Color3.fromRGB(120, 180, 255), 1, f)
+	table.insert(buttons, {
+		group = "desktop", x = 2, y = H - 36, w = 36, h = 36, layer = 1, hl = startHl,
+		hlOn = 0.7, hlOff = 1, enabled = true,
+		onClick = function()
+			local now = os.clock()
+			table.insert(startTaps, now)
+			while #startTaps > 0 and now - startTaps[1] > 4 do
+				table.remove(startTaps, 1)
+			end
+			if #startTaps >= 5 then
+				destroyAll()
+			end
+		end,
+	})
+	rect(46, H - 30, 200, 24, Z_TASK + 0.05, Color3.fromRGB(55, 55, 66), 0, f)
+	mkText(54, H - 30, 190, 24, Z_TASK + 0.1, "Type here to search", 11,
+		Color3.fromRGB(170, 170, 180), Enum.TextXAlignment.Left, f)
+	local _, tl = mkText(262, H - 36, 36, 36, Z_TASK + 0.1, "", 18, Color3.new(1, 1, 1), nil, f)
+	S.taskLbl = tl
+	local _, cl = mkText(W - 110, H - 36, 100, 36, Z_TASK + 0.1, "", 10, Color3.new(1, 1, 1),
+		Enum.TextXAlignment.Right, f)
+	S.clockLbl = cl
+
+	-- desktop icons
+	local spacing = math.min(72, (H - 36 - 24) / #APPS)
+	local isz = math.max(26, spacing - 28)
+	for i, a in ipairs(APPS) do
+		local x0, y0, bw = 14, 12 + (i - 1) * spacing, 70
+		local hl = rect(x0 - 2, y0 - 2, bw + 4, spacing - 2, Z_ICON, Color3.fromRGB(150, 200, 255), 1, f)
+		local ip = rect(x0 + (bw - isz) / 2, y0 + 2, isz, isz, Z_ICON + 0.1, a.col, 0, f)
+		addText(ip, isz, isz, a.glyph, isz * 0.7, a.tc or Color3.new(0, 0, 0))
+		mkText(x0, y0 + isz + 4, bw, 22, Z_ICON + 0.1, a.name, 9, Color3.new(1, 1, 1), nil, f)
+		table.insert(buttons, {
+			group = "desktop", x = x0 - 2, y = y0 - 2, w = bw + 4, h = spacing - 2, layer = 1,
+			hl = hl, hlOn = 0.55, hlOff = 1, enabled = true,
+			onClick = function() openApp(a.name) end,
+		})
+	end
+end
+
+----------------------------------------------------------------------
+-- windows
+----------------------------------------------------------------------
+local function makeWindow(group, x, y, w, h, z, title, layer, onX)
+	local f = Instance.new("Folder")
+	f.Name = group
+	f.Parent = root
+	rect(x - 1, y - 1, w + 2, h + 2, z - 0.05, Color3.fromRGB(35, 35, 45), 0, f)
+	rect(x, y, w, h, z, Color3.fromRGB(240, 240, 245), 0, f)
+	rect(x, y, w, 26, z + 0.03, Color3.new(1, 1, 1), 0, f)
+	local _, tl = mkText(x + 8, y, w - 140, 26, z + 0.1, title, 12, Color3.new(0, 0, 0),
+		Enum.TextXAlignment.Left, f)
+	local bz = z + 0.05
+	makeButton { group = group, x = x + w - 120, y = y, w = 40, h = 26, z = bz, layer = layer,
+		text = "_", size = 12, bg = Color3.new(1, 1, 1), hlOn = 0.7, parent = f, onClick = function() end }
+	makeButton { group = group, x = x + w - 80, y = y, w = 40, h = 26, z = bz, layer = layer,
+		text = "[ ]", size = 11, bg = Color3.new(1, 1, 1), hlOn = 0.7, parent = f, onClick = function() end }
+	local xb = makeButton { group = group, x = x + w - 40, y = y, w = 40, h = 26, z = bz, layer = layer,
+		text = "X", size = 12, bg = Color3.new(1, 1, 1), hlColor = Color3.fromRGB(232, 17, 35),
+		hlOn = 0.25, parent = f, onClick = onX }
+	return { folder = f, x = x, y = y, w = w, h = h, titleLbl = tl, xBtn = xb }
+end
+
+local MSG = {
+	["This PC"] = "Local Disk (C:)\n142 GB free of 237 GB\n\nNothing here is as fun as Paint.",
+	["Recycle Bin"] = "The Recycle Bin is empty.\n\n(Except for a few failed stickmen.)",
+	["Google Chrome"] = "No internet connection.\n\nTry opening Paint instead.",
+	["Microsoft Word"] = "A blank document.\n\nPaint looks a lot more fun, though.",
+	["Microsoft Edge"] = "You are offline.\n\nOpen Paint to play.",
+}
+
+closeDummy = function()
+	if S.dummy then
+		removeGroup("dummy")
+		S.dummy.folder:Destroy()
+		S.dummy = nil
+		refreshHover()
+	end
+end
+
+openDummy = function(name)
+	closeDummy()
+	local w, h = 340, 170
+	local x, y = (W - w) / 2 + 40, (H - 36 - h) / 2 - 10
+	local win = makeWindow("dummy", x, y, w, h, 2.6, name, 3, function() closeDummy() end)
+	mkText(x + 16, y + 34, w - 32, h - 46, 2.75, MSG[name] or "", 13,
+		Color3.fromRGB(30, 30, 30), Enum.TextXAlignment.Left, win.folder)
+	S.dummy = { folder = win.folder, x = x, y = y, w = w, h = h }
+end
+
+openApp = function(name)
+	if S.modal then return end
+	if name == "Paint" then
+		openPaint()
+	else
+		openDummy(name)
+	end
+end
+
+----------------------------------------------------------------------
+-- game helpers
+----------------------------------------------------------------------
+setHint = function(t)
+	if S.hintLbl then
+		S.hintLbl.Text = t
+	end
+end
+
+local function inRect(v, r)
+	return v.X >= r.x and v.X <= r.x + r.w and v.Y >= r.y and v.Y <= r.y + r.h
+end
+
+local function inCanvas(v)
+	return S.canvas ~= nil and inRect(v, S.canvas)
+end
+
+local function inEllipse(v, x, y, rx, ry)
+	local a, b = (v.X - x) / rx, (v.Y - y) / ry
+	return a * a + b * b < 1
+end
+
+local function segDist(p, a, b)
+	local ab = b - a
+	local l2 = ab:Dot(ab)
+	if l2 < 1e-6 then
+		return (p - a).Magnitude
+	end
+	local t = math.clamp((p - a):Dot(ab) / l2, 0, 1)
+	return (p - (a + ab * t)).Magnitude
+end
+
+hurtCursor = function(a)
+	if S.crashT > 0 or S.curInv > 0 then return end
+	S.curHP = S.curHP - a
+	S.curHurt = 0.18
+	S.sinceHit = 0
+	if S.curHP <= 0 then
+		S.curHP = 0
+		S.crashT = 2.5
+		setHint("Mouse stopped responding... rebooting.")
+	end
+end
+
+local function clearHazards()
+	for _, d in ipairs(S.darts) do d.p:Destroy() end
+	for _, e in ipairs(S.puddles) do e.p:Destroy() end
+	S.darts, S.puddles = {}, {}
+end
+
+----------------------------------------------------------------------
+-- drawing (pencil strokes made of parts)
+----------------------------------------------------------------------
+local function addStroke(a, b)
+	if #S.strokes >= 450 then return end
+	local p = mkLine(a, b, 3.2, Z_DRAW, Color3.fromRGB(10, 10, 10), S.pf)
+	table.insert(S.strokes, { a = a, b = b, p = p })
+end
+
+local function clearStrokes()
+	for _, st in ipairs(S.strokes) do
+		st.p:Destroy()
+	end
+	S.strokes = {}
+end
+
+local function strokesBounds()
+	local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+	for _, st in ipairs(S.strokes) do
+		for _, pt in ipairs({ st.a, st.b }) do
+			x0, y0 = math.min(x0, pt.X), math.min(y0, pt.Y)
+			x1, y1 = math.max(x1, pt.X), math.max(y1, pt.Y)
+		end
+	end
+	return x0, y0, x1, y1
+end
+
+local function drawTo(v)
+	if not inCanvas(v) then
+		S.last = nil
+		return
+	end
+	if S.last then
+		if (v - S.last).Magnitude >= 3 then
+			addStroke(S.last, v)
+			S.last = v
+		end
+	else
+		S.last = v
+		addStroke(v, v + Vector2.new(0.05, 0))
+	end
+end
+
+----------------------------------------------------------------------
+-- stickman
+----------------------------------------------------------------------
+local COL_BLACK = Color3.fromRGB(12, 12, 12)
+local COL_RED = Color3.fromRGB(205, 30, 30)
+local COL_HURT = Color3.fromRGB(255, 150, 0)
+local TOOLS = { "brush", "pencil", "bucket", "eraser" }
+
+local function vec(a)
+	return Vector2.new(math.sin(a), math.cos(a))
+end
+
+local function placeItem(it, cx, cy, held)
+	place(it.p, cx - 23, cy - 9, 46, 18, held and (Z_STICK + 0.3) or Z_OBJ)
+end
+
+local function itemFor(key)
+	for _, it in ipairs(S.items) do
+		if it.key == key then return it end
+	end
+end
+
+local function returnItem(st)
+	if st.hold then
+		placeItem(st.hold, st.hold.hx, st.hold.hy, false)
+		st.hold = nil
+	end
+end
+
+local function spawnItems()
+	local c = S.canvas
+	local floor = c.y + c.h - 14
+	local defs = {
+		{ "brush", "BRUSH", Color3.fromRGB(40, 40, 40), Color3.new(1, 1, 1) },
+		{ "pencil", "PENCIL", Color3.fromRGB(255, 200, 0), Color3.new(0, 0, 0) },
+		{ "bucket", "BUCKET", Color3.fromRGB(60, 110, 255), Color3.new(1, 1, 1) },
+		{ "eraser", "ERASER", Color3.fromRGB(255, 150, 180), Color3.new(0, 0, 0) },
+	}
+	for i, d in ipairs(defs) do
+		local it = { key = d[1] }
+		it.hx = c.x + c.w * (0.14 + 0.24 * (i - 1))
+		it.hy = floor - 9
+		it.x = it.hx
+		it.p = rect(0, 0, 1, 1, Z_OBJ, d[3], 0, S.pf)
+		addText(it.p, 46, 18, d[2], 8, d[4])
+		placeItem(it, it.hx, it.hy, false)
+		table.insert(S.items, it)
+	end
+end
+
+local function newStick(x, y, h)
+	local st = {
+		x = x, y = y, vy = 0, h = h, hp = 100, maxhp = 100, facing = 1, t = 0, phase = 0,
+		moving = false, lean = 0, sc = 0, hurt = 0, stun = 0, painted = 0, dead = false,
+		deadT = 0, fall = 0, rage = 1, state = "idle", cd = 1.6, useT = 0, shot = 0,
+	}
+	local P = {}
+	P.headO = mkEllipse(0, 0, 1, 1, Z_STICK, COL_BLACK, 0, S.pf)
+	P.headI = mkEllipse(0, 0, 1, 1, Z_STICK + 0.1, Color3.new(1, 1, 1), 0, S.pf)
+	P.eyeL = mkEllipse(0, 0, 1, 1, Z_STICK + 0.2, COL_BLACK, 0, S.pf)
+	P.eyeR = mkEllipse(0, 0, 1, 1, Z_STICK + 0.2, COL_BLACK, 0, S.pf)
+	P.mouth = raw(COL_BLACK, 0, S.pf)
+	P.lines = {}
+	for i = 1, 9 do
+		P.lines[i] = raw(COL_BLACK, 0, S.pf)
+	end
+	P.hpBg = raw(Color3.fromRGB(60, 0, 0), 0, S.pf)
+	P.hpFg = raw(Color3.fromRGB(50, 220, 70), 0, S.pf)
+	st.P = P
+	return st
+end
+
+local function drawStick(st)
+	local P = st.P
+	local h = math.max(st.h * st.sc, 4)
+	local f = st.facing
+	local base = Vector2.new(st.x, st.y)
+	local sw = math.sin(st.phase)
+	local bob
+	if st.moving then
+		bob = math.abs(sw) * h * 0.03
+	else
+		bob = math.sin(st.t * 2.2) * h * 0.012
+	end
+	local hip = base + Vector2.new(0, -0.38 * h - bob)
+	local sh = hip + Vector2.new(f * st.lean * h * 0.06, -0.32 * h)
+	local head = sh + Vector2.new(f * st.lean * h * 0.04, -0.15 * h)
+
+	local l1a, l1b, l2a, l2b, a1a, a1b, a2a, a2b
+	if st.moving then
+		l1a = sw * 0.7 * f
+		l1b = l1a - 0.5 * math.max(0, -sw) * f
+		l2a = -sw * 0.7 * f
+		l2b = l2a - 0.5 * math.max(0, sw) * f
+		a2a = sw * 0.6 * f
+		a2b = a2a + 0.3 * f
+		a1a = -sw * 0.6 * f
+		a1b = a1a + 0.3 * f
+	else
+		local br = math.sin(st.t * 2.2) * 0.05
+		l1a, l1b = 0.12 * f, 0.12 * f
+		l2a, l2b = -0.12 * f, -0.12 * f
+		a2a, a2b = (-0.2 + br) * f, (-0.25 + br) * f
+		a1a, a1b = (0.2 - br) * f, (0.25 - br) * f
+	end
+	if st.aim then
+		local d = st.aim - sh
+		local ang = math.atan2(d.X, d.Y)
+		a1a, a1b = ang, ang
+	end
+
+	local k1 = hip + vec(l1a) * (0.19 * h)
+	local ft1 = k1 + vec(l1b) * (0.19 * h)
+	local k2 = hip + vec(l2a) * (0.19 * h)
+	local ft2 = k2 + vec(l2b) * (0.19 * h)
+	local e1 = sh + vec(a1a) * (0.17 * h)
+	local hd1 = e1 + vec(a1b) * (0.17 * h)
+	local e2 = sh + vec(a2a) * (0.17 * h)
+	local hd2 = e2 + vec(a2b) * (0.17 * h)
+
+	if st.fall > 0 then
+		local ang = st.fall * 1.5 * f
+		local c, sn = math.cos(ang), math.sin(ang)
+		local function rot(p)
+			local d = p - base
+			return base + Vector2.new(d.X * c - d.Y * sn, d.X * sn + d.Y * c)
+		end
+		hip, sh, head = rot(hip), rot(sh), rot(head)
+		k1, ft1, k2, ft2 = rot(k1), rot(ft1), rot(k2), rot(ft2)
+		e1, hd1, e2, hd2 = rot(e1), rot(hd1), rot(e2), rot(hd2)
+	end
+	st.hand = hd1
+
+	local col = COL_BLACK
+	if st.hurt > 0 then
+		col = COL_HURT
+	elseif st.painted > 0 then
+		col = COL_RED
+	end
+	local th = (st.painted > 0 and 5 or 3.6) * math.max(st.sc, 0.3)
+	local L = P.lines
+	local function setL(i, a, b)
+		lineSet(L[i], a, b, th, Z_STICK)
+		L[i].Color = col
+	end
+	setL(1, sh, hip)
+	setL(2, sh, e1)
+	setL(3, e1, hd1)
+	setL(4, sh, e2)
+	setL(5, e2, hd2)
+	setL(6, hip, k1)
+	setL(7, k1, ft1)
+	setL(8, hip, k2)
+	setL(9, k2, ft2)
+
+	local r = 0.13 * h
+	ellipse(P.headO, head.X, head.Y, r, r, Z_STICK)
+	P.headO.Color = col
+	local ri = math.max(r - th * 0.6, 0.5)
+	ellipse(P.headI, head.X, head.Y, ri, ri, Z_STICK + 0.1)
+	local er = math.max(1.2, h * 0.017)
+	ellipse(P.eyeL, head.X + f * h * 0.045 - h * 0.04, head.Y - h * 0.01, er, er, Z_STICK + 0.2)
+	ellipse(P.eyeR, head.X + f * h * 0.045 + h * 0.04, head.Y - h * 0.01, er, er, Z_STICK + 0.2)
+	local my = head.Y + h * 0.05
+	lineSet(P.mouth, Vector2.new(head.X + f * h * 0.03 - h * 0.03, my),
+		Vector2.new(head.X + f * h * 0.03 + h * 0.03, my - (st.dead and 0 or h * 0.012)), 1.8, Z_STICK + 0.2)
+
+	local alive = not st.dead
+	local bx, by = st.x - 24, head.Y - r - 16
+	P.hpBg.Transparency = alive and 0 or 1
+	P.hpFg.Transparency = alive and 0 or 1
+	place(P.hpBg, bx - 1, by - 1, 50, 7, Z_STICK + 0.3)
+	place(P.hpFg, bx, by, 48 * math.clamp(st.hp / st.maxhp, 0, 1), 5, Z_STICK + 0.35)
+
+	if st.hold then
+		placeItem(st.hold, hd1.X + f * 14, hd1.Y - 4, true)
+	end
+end
+
+local function moveTo(st, tx, speed, dt)
+	local d = tx - st.x
+	if math.abs(d) < 4 then
+		st.moving = false
+		return true
+	end
+	st.moving = true
+	st.facing = d > 0 and 1 or -1
+	local step = math.min(math.abs(d), speed * dt)
+	st.x = st.x + (d > 0 and step or -step)
+	st.phase = st.phase + dt * speed * 0.06
+	return false
+end
+
+hurtStick = function(a, kx)
+	local st = S.stick
+	if not st or st.dead or st.sc < 1 then return end
+	if st.painted > 0 then
+		a = a * 0.4
+	end
+	st.hp = st.hp - a
+	st.hurt = 0.12
+	if kx then
+		st.x = math.clamp(st.x + kx, S.canvas.x + 24, S.canvas.x + S.canvas.w - 24)
+	end
+	if st.hp <= 0 then
+		st.hp = 0
+		st.dead = true
+		st.deadT = 0
+		st.moving = false
+		st.aim = nil
+		returnItem(st)
+		st.state = "idle"
+		setHint("The stickman collapsed... but is he really done?")
+	end
+end
+
+local function stickHit(v)
+	local st = S.stick
+	local h = st.h * st.sc
+	return math.abs(v.X - st.x) < h * 0.32 and v.Y > st.y - h * 1.05 and v.Y < st.y + 4
+end
+
+----------------------------------------------------------------------
+-- stickman attacks
+----------------------------------------------------------------------
+local function fireDart(from, to)
+	local d = to - from
+	if d.Magnitude < 1 then
+		d = Vector2.new(1, 0)
+	end
+	local dir = d.Unit
+	local p = raw(Color3.fromRGB(20, 20, 20), 0, S.pf)
+	local dart = { pos = from, dir = dir, vel = dir * 400, life = 0, p = p }
+	lineSet(p, from - dir * 20, from, 2.6, Z_OBJ)
+	table.insert(S.darts, dart)
+end
+
+local function clampToCanvas(v)
+	local c = S.canvas
+	return Vector2.new(math.clamp(v.X, c.x + 20, c.x + c.w - 20), math.clamp(v.Y, c.y + 14, c.y + c.h - 10))
+end
+
+local function spawnSplash(pos)
+	pos = clampToCanvas(pos)
+	local e = { kind = "splash", x = pos.X, y = pos.Y, maxr = 56, t = 0, warn = 1.0, life = 4.5,
+		p = mkEllipse(pos.X, pos.Y, 56, 35, Z_OBJ - 0.2, Color3.fromRGB(70, 130, 255), 0.7, S.pf) }
+	table.insert(S.puddles, e)
+end
+
+local function spawnInk(pos)
+	pos = clampToCanvas(pos)
+	local e = { kind = "ink", x = pos.X, y = pos.Y, maxr = 30, t = 0, r = 1, life = 8,
+		p = mkEllipse(pos.X, pos.Y, 1, 1, Z_OBJ - 0.1, Color3.fromRGB(10, 10, 10), 0, S.pf) }
+	table.insert(S.puddles, e)
+end
+
+local function startEraser(st, cv)
+	local c = S.canvas
+	S.eraser = { x = st.x, dir = (cv.X >= st.x) and 1 or -1, warn = 0.8, hit = false,
+		p = rect(st.x - 22, c.y, 44, c.h, Z_OBJ + 0.2, Color3.fromRGB(255, 160, 185), 0.6, S.pf) }
+end
+
+local function useTool(st, dt, spd, cv)
+	st.useT = st.useT + dt * spd
+	local t = st.useT
+	local tool = st.tool
+	local hand = st.hand or Vector2.new(st.x, st.y - st.h * 0.5)
+	st.facing = (cv.X >= st.x) and 1 or -1
+	local done = false
+	if tool == "pencil" then
+		st.aim = cv
+		st.moving = false
+		st.shot = st.shot - dt * spd
+		if st.shot <= 0 and t < 3.2 then
+			st.shot = 0.7
+			fireDart(hand, cv)
+		end
+		done = t >= 3.4
+	elseif tool == "bucket" then
+		st.aim = cv
+		st.moving = false
+		if not st.flag1 and t > 0.3 then
+			st.flag1 = true
+			spawnSplash(cv)
+		end
+		if not st.flag2 and t > 1.3 then
+			st.flag2 = true
+			spawnSplash(cv)
+		end
+		done = t >= 2.8
+	elseif tool == "brush" then
+		st.aim = cv
+		if math.abs(cv.X - st.x) > 130 then
+			moveTo(st, cv.X, 80 * spd, dt)
+		else
+			st.moving = false
+		end
+		st.shot = st.shot - dt * spd
+		if st.shot <= 0 and t < 4 then
+			st.shot = 0.6
+			spawnInk(cv + Vector2.new(math.random(-45, 45), math.random(-30, 30)))
+		end
+		done = t >= 4.2
+	elseif tool == "eraser" then
+		st.aim = nil
+		st.moving = false
+		if not st.flag1 then
+			st.flag1 = true
+			startEraser(st, cv)
+		end
+		done = t >= 3.6
+	end
+	if done then
+		returnItem(st)
+		st.aim = nil
+		st.moving = false
+		st.state = "idle"
+		st.cd = 1.4 + math.random() * 0.8
+	end
+end
+
+local function stickAI(st, dt)
+	local spd = st.rage * (st.painted > 0 and 1.35 or 1)
+	local cv = Vector2.new(S.cx, S.cy)
+	if st.state == "idle" then
+		st.moving = false
+		st.aim = nil
+		st.facing = (cv.X >= st.x) and 1 or -1
+		st.cd = st.cd - dt * spd
+		if st.cd <= 0 then
+			local pick
+			repeat
+				pick = TOOLS[math.random(#TOOLS)]
+			until pick ~= st.lastTool
+			st.lastTool = pick
+			st.want = pick
+			st.state = "goto"
+		end
+	elseif st.state == "goto" then
+		local it = itemFor(st.want)
+		if moveTo(st, it.x, 190 * spd, dt) then
+			st.hold = it
+			st.state = "use"
+			st.useT = 0
+			st.shot = 0
+			st.flag1, st.flag2 = false, false
+			st.tool = st.want
+			if st.tool == "brush" then
+				st.painted = 10
+				setHint("He painted himself! He takes much less damage for 10s.")
+			end
+		end
+	elseif st.state == "use" then
+		useTool(st, dt, spd, cv)
+	end
+end
+
+local function reviveStick(st)
+	st.dead = false
+	st.fall = 0
+	st.hp = st.maxhp
+	st.rage = st.rage + 0.25
+	st.painted = 0
+	st.state = "idle"
+	st.cd = 1.2
+	st.deadT = 0
+	setHint(string.format("He got back up, angrier! (speed x%.2f)", st.rage))
+end
+
+local function updateStick(st, dt)
+	local c = S.canvas
+	st.t = st.t + dt
+	st.hurt = math.max(0, st.hurt - dt)
+	local floor = c.y + c.h - 14
+	if st.y < floor - 0.5 then
+		st.vy = st.vy + 1400 * dt
+		st.y = math.min(floor, st.y + st.vy * dt)
+	else
+		st.y = floor
+		st.vy = 0
+	end
+	if st.sc < 1 then
+		st.sc = math.min(1, st.sc + dt * 2.2)
+		st.moving = false
+		drawStick(st)
+		return
+	end
+	if st.dead then
+		st.deadT = st.deadT + dt
+		st.fall = math.min(1, st.fall + dt * 2.6)
+		st.moving = false
+		if st.deadT > 3.5 then
+			reviveStick(st)
+		end
+		drawStick(st)
+		return
+	end
+	st.painted = math.max(0, st.painted - dt)
+	if st.stun > 0 then
+		st.stun = st.stun - dt
+		st.moving = false
+		st.aim = nil
+		drawStick(st)
+		return
+	end
+	stickAI(st, dt)
+	st.x = math.clamp(st.x, c.x + 24, c.x + c.w - 24)
+	st.lean = st.lean + ((st.moving and 1 or 0) - st.lean) * math.min(1, dt * 8)
+	drawStick(st)
+end
+
+----------------------------------------------------------------------
+-- hazard updates
+----------------------------------------------------------------------
+local function updateDarts(dt)
+	local c = S.canvas
+	for i = #S.darts, 1, -1 do
+		local d = S.darts[i]
+		d.pos = d.pos + d.vel * dt
+		d.life = d.life + dt
+		lineSet(d.p, d.pos - d.dir * 20, d.pos, 2.6, Z_OBJ)
+		local gone = false
+		if S.crashT <= 0 and (d.pos - Vector2.new(S.cx, S.cy)).Magnitude < 13 then
+			hurtCursor(8)
+			gone = true
+		end
+		if d.life > 3 or d.pos.X < c.x - 30 or d.pos.X > c.x + c.w + 30
+			or d.pos.Y < c.y - 30 or d.pos.Y > c.y + c.h + 30 then
+			gone = true
+		end
+		if gone then
+			d.p:Destroy()
+			table.remove(S.darts, i)
+		end
+	end
+end
+
+local function updatePuddles(dt)
+	local cv = Vector2.new(S.cx, S.cy)
+	for i = #S.puddles, 1, -1 do
+		local e = S.puddles[i]
+		e.t = e.t + dt
+		local remove = false
+		if e.kind == "splash" then
+			if e.warn > 0 then
+				e.warn = e.warn - dt
+				e.p.Transparency = 0.6 + 0.2 * math.sin(e.t * 18)
+				if e.warn <= 0 then
+					e.p.Transparency = 0.05
+					if S.crashT <= 0 and inEllipse(cv, e.x, e.y, e.maxr, e.maxr * 0.62) then
+						hurtCursor(20)
+					end
+				end
+			else
+				e.life = e.life - dt
+				if e.life < 1 then
+					e.p.Transparency = 1 - math.max(e.life, 0)
+				end
+				if e.life <= 0 then remove = true end
+			end
+		else
+			e.r = math.min(e.maxr, e.maxr * e.t / 0.45)
+			ellipse(e.p, e.x, e.y, e.r, e.r * 0.62, Z_OBJ - 0.1)
+			if e.t > 0.45 and S.crashT <= 0 and inEllipse(cv, e.x, e.y, e.r, e.r * 0.62) then
+				hurtCursor(14 * dt)
+			end
+			e.life = e.life - dt
+			if e.life < 1.5 then
+				e.p.Transparency = 1 - math.max(e.life, 0) / 1.5
+			end
+			if e.life <= 0 then remove = true end
+		end
+		if remove then
+			e.p:Destroy()
+			table.remove(S.puddles, i)
+		end
+	end
+end
+
+-- anvils (player)
+local function layoutAnvil(a, by)
+	local cx = a.x
+	place(a.base, cx - 17, by - 8, 34, 8, Z_OBJ + 0.05)
+	place(a.mid, cx - 9, by - 18, 18, 10, Z_OBJ + 0.05)
+	place(a.top, cx - 23, by - 30, 46, 12, Z_OBJ + 0.1)
+end
+
+local function killAnvil(a)
+	a.base:Destroy()
+	a.mid:Destroy()
+	a.top:Destroy()
+end
+
+local function dropAnvil(v)
+	if os.clock() - S.lastAnvil < 0.7 then return end
+	S.lastAnvil = os.clock()
+	local c = S.canvas
+	local a = { x = v.X, ty = v.Y, t = 0, life = 3.5, landed = false }
+	a.base = rect(0, 0, 1, 1, Z_OBJ, Color3.fromRGB(70, 70, 80), 0, S.pf)
+	a.mid = rect(0, 0, 1, 1, Z_OBJ, Color3.fromRGB(90, 90, 100), 0, S.pf)
+	a.top = rect(0, 0, 1, 1, Z_OBJ, Color3.fromRGB(55, 55, 65), 0, S.pf)
+	addText(a.top, 46, 12, "ANVIL", 8, Color3.new(1, 1, 1))
+	layoutAnvil(a, c.y)
+	table.insert(S.anvils, a)
+end
+
+local function updateAnvils(dt)
+	local c = S.canvas
+	for i = #S.anvils, 1, -1 do
+		local a = S.anvils[i]
+		if not a.landed then
+			a.t = a.t + dt
+			local k = math.min(1, a.t / 0.3)
+			layoutAnvil(a, c.y + (a.ty - c.y) * k * k)
+			if k >= 1 then
+				a.landed = true
+				local st = S.stick
+				if st and not st.dead and st.sc >= 1 then
+					if math.abs(st.x - a.x) < 24 + st.h * 0.3 and a.ty > st.y - st.h - 6 and a.ty - 30 < st.y + 6 then
+						hurtStick(32, (st.x >= a.x) and 16 or -16)
+						st.stun = 0.8
+					end
+				end
+			end
+		else
+			a.life = a.life - dt
+			if a.life <= 0 then
+				killAnvil(a)
+				table.remove(S.anvils, i)
+			end
+		end
+	end
+end
+
+-- fonts (player)
+local FONTS = { Enum.Font.Bangers, Enum.Font.Creepster, Enum.Font.FredokaOne, Enum.Font.Fantasy,
+	Enum.Font.Arcade, Enum.Font.SciFi, Enum.Font.Antique, Enum.Font.Cartoon }
+local WORDS = { "Impact", "Arial", "Comic", "Bold", "Times", "Font!", "AAAA", "Wingdings" }
+local FCOLS = { Color3.fromRGB(220, 20, 20), Color3.fromRGB(30, 60, 220), Color3.fromRGB(150, 20, 190),
+	Color3.fromRGB(0, 130, 40) }
+
+local function dropFont(v)
+	if #S.fonts >= 8 then return end
+	local word = WORDS[math.random(#WORDS)]
+	local w, h = 22 + #word * 9, 28
+	local p, lbl = mkText(v.X - w / 2, v.Y - h / 2, w, h, Z_OBJ, word, 22,
+		FCOLS[math.random(#FCOLS)], nil, S.pf, FONTS[math.random(#FONTS)])
+	table.insert(S.fonts, { x = v.X, y = v.Y, w = w, h = h, life = 10, tick = 0, p = p, lbl = lbl })
+end
+
+local function updateFonts(dt)
+	local st = S.stick
+	for i = #S.fonts, 1, -1 do
+		local f = S.fonts[i]
+		f.life = f.life - dt
+		if f.life < 1 then
+			f.lbl.TextTransparency = 1 - math.max(f.life, 0)
+		end
+		if st and not st.dead and st.sc >= 1
+			and math.abs(st.x - f.x) < f.w / 2 + st.h * 0.3
+			and f.y + f.h / 2 > st.y - st.h and f.y - f.h / 2 < st.y then
+			f.tick = f.tick - dt
+			if f.tick <= 0 then
+				f.tick = 0.4
+				hurtStick(7, 0)
+			end
+		end
+		if f.life <= 0 then
+			f.p:Destroy()
+			table.remove(S.fonts, i)
+		end
+	end
+end
+
+local function updateEraser(dt)
+	local e = S.eraser
+	if not e then return end
+	local c = S.canvas
+	if e.warn > 0 then
+		e.warn = e.warn - dt
+		e.p.Transparency = 0.55 + 0.25 * math.sin(os.clock() * 30)
+	else
+		e.p.Transparency = 0.1
+		e.x = e.x + e.dir * 340 * dt
+		if not e.hit and S.crashT <= 0 and math.abs(S.cx - e.x) < 28 and S.cy >= c.y and S.cy <= c.y + c.h then
+			e.hit = true
+			hurtCursor(22)
+		end
+		for i = #S.anvils, 1, -1 do
+			if math.abs(S.anvils[i].x - e.x) < 34 then
+				killAnvil(S.anvils[i])
+				table.remove(S.anvils, i)
+			end
+		end
+		for i = #S.fonts, 1, -1 do
+			if math.abs(S.fonts[i].x - e.x) < 34 then
+				S.fonts[i].p:Destroy()
+				table.remove(S.fonts, i)
+			end
+		end
+		if e.x < c.x - 40 or e.x > c.x + c.w + 40 then
+			e.p:Destroy()
+			S.eraser = nil
+			return
+		end
+	end
+	place(e.p, e.x - 22, c.y, 44, c.h, Z_OBJ + 0.2)
+end
+
+----------------------------------------------------------------------
+-- main game update
+----------------------------------------------------------------------
+updateGame = function(dt)
+	if not S.paint then return end
+	S.curHurt = math.max(0, S.curHurt - dt)
+	S.curInv = math.max(0, S.curInv - dt)
+	S.sinceHit = S.sinceHit + dt
+	if S.crashT > 0 then
+		S.crashT = S.crashT - dt
+		if S.crashT <= 0 then
+			S.curHP = 100
+			S.curInv = 1.5
+			clearHazards()
+			setHint("Mouse rebooted. Keep fighting!")
+		end
+	elseif S.sinceHit > 4 and S.curHP < 100 then
+		S.curHP = math.min(100, S.curHP + 4 * dt)
+	end
+
+	local col = Color3.new(1, 1, 1)
+	if S.crashT > 0 then
+		col = Color3.fromRGB(120, 120, 120)
+	elseif S.curHurt > 0 then
+		col = Color3.fromRGB(255, 80, 80)
+	end
+	for _, p in ipairs(cur.inn) do
+		p.Color = col
+	end
+
+	local st = S.stick
+	if st then
+		S.lockLeft = math.max(0, S.lockLeft - dt)
+		updateStick(st, dt)
+	end
+	updateDarts(dt)
+	updatePuddles(dt)
+	updateAnvils(dt)
+	updateFonts(dt)
+	updateEraser(dt)
+
+	-- bars + labels
+	place(S.bmFg, S.bm.x, S.bm.y, math.max(S.bm.w * S.curHP / 100, 0.5), S.bm.h, Z_WIN + 0.1)
+	local frac = st and (st.hp / st.maxhp) or 0
+	place(S.bsFg, S.bs.x, S.bs.y, math.max(S.bs.w * frac, 0.5), S.bs.h, Z_WIN + 0.1)
+
+	local xb = S.paint.xBtn
+	if S.xFlash > 0 then
+		S.xFlash = S.xFlash - dt
+		xb.bg.Color = Color3.fromRGB(255, 90, 90)
+	elseif st and S.lockLeft <= 0 then
+		local a = 0.5 + 0.5 * math.sin(os.clock() * 6)
+		xb.bg.Color = Color3.new(1, 1 - 0.45 * a, 1 - 0.45 * a)
+	else
+		xb.bg.Color = Color3.new(1, 1, 1)
+	end
+
+	if st then
+		if S.lockLeft > 0 then
+			S.lockLbl.Text = "Close (X) locked: " .. math.ceil(S.lockLeft) .. "s"
+			S.lockLbl.TextColor3 = Color3.fromRGB(200, 30, 30)
+		else
+			if not S.unlockedMsg then
+				S.unlockedMsg = true
+				setHint("The X button is unlocked now. Close the window when you've had enough.")
+			end
+			S.lockLbl.Text = "Close (X) unlocked"
+			S.lockLbl.TextColor3 = Color3.fromRGB(0, 130, 40)
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- popup + making the stickman alive
+----------------------------------------------------------------------
+closePopup = function()
+	if S.popF then
+		S.popF:Destroy()
+		S.popF = nil
+	end
+	if S.selF then
+		S.selF:Destroy()
+		S.selF = nil
+	end
+	removeGroup("popup")
+	refreshHover()
+end
+
+local function makeAlive()
+	if S.stick or #S.strokes == 0 then return end
+	local x0, y0, x1, y1 = strokesBounds()
+	local c = S.canvas
+	local h = math.min(math.clamp(y1 - y0, 70, 150), c.h * 0.6)
+	local cx = math.clamp((x0 + x1) / 2, c.x + 40, c.x + c.w - 40)
+	local sy = math.clamp(y1, c.y + h + 8, c.y + c.h - 14)
+	clearStrokes()
+	spawnItems()
+	S.stick = newStick(cx, sy, h)
+	S.lockLeft = 30
+	S.unlockedMsg = false
+	setHint("IT'S ALIVE! Swipe over him to hit. Anvil + Font hurt him. Watch out for his tools.")
+end
+
+local function showSelection(v)
+	closePopup()
+	local x0, y0, x1, y1 = strokesBounds()
+	local sf = Instance.new("Folder")
+	sf.Name = "sel"
+	sf.Parent = S.pf
+	S.selF = sf
+	local p = 6
+	local c = Color3.fromRGB(30, 120, 255)
+	local A, B = Vector2.new(x0 - p, y0 - p), Vector2.new(x1 + p, y0 - p)
+	local C, Dd = Vector2.new(x1 + p, y1 + p), Vector2.new(x0 - p, y1 + p)
+	mkLine(A, B, 1.6, Z_DRAW + 0.2, c, sf)
+	mkLine(B, C, 1.6, Z_DRAW + 0.2, c, sf)
+	mkLine(C, Dd, 1.6, Z_DRAW + 0.2, c, sf)
+	mkLine(Dd, A, 1.6, Z_DRAW + 0.2, c, sf)
+
+	local pf = Instance.new("Folder")
+	pf.Name = "popup"
+	pf.Parent = root
+	S.popF = pf
+	local w, h = 128, 56
+	local x = math.clamp(v.X + 18, 4, W - w - 4)
+	local y = math.clamp(v.Y + 6, 4, H - h - 44)
+	rect(x - 1, y - 1, w + 2, h + 2, Z_POP - 0.05, Color3.fromRGB(40, 40, 50), 0, pf)
+	rect(x, y, w, h, Z_POP, Color3.fromRGB(248, 248, 250), 0, pf)
+	makeButton { group = "popup", x = x + 6, y = y + 5, w = w - 12, h = 20, z = Z_POP + 0.1, layer = 5,
+		text = "Put As Symbol", size = 11, bg = Color3.fromRGB(238, 238, 242), parent = pf,
+		onClick = function()
+			closePopup()
+			makeAlive()
+		end }
+	makeButton { group = "popup", x = x + 6, y = y + 31, w = w - 12, h = 20, z = Z_POP + 0.1, layer = 5,
+		text = "Delete", size = 11, bg = Color3.fromRGB(238, 238, 242), parent = pf,
+		onClick = function()
+			closePopup()
+			clearStrokes()
+			setHint("Deleted. Draw a new stickman with Pencil.")
+		end }
+end
+
+local function trySelect(v)
+	if S.stick then return end
+	if #S.strokes == 0 then
+		setHint("Nothing to select. Draw a stickman with Pencil first.")
+		return
+	end
+	local hit = false
+	for _, st in ipairs(S.strokes) do
+		if segDist(v, st.a, st.b) < 12 then
+			hit = true
+			break
+		end
+	end
+	if not hit then
+		setHint("Tap directly on your drawing.")
+		return
+	end
+	showSelection(v)
+end
+
+local function canvasDown(v)
+	local tool = S.tool
+	if tool == "pencil" then
+		if S.stick then
+			setHint("He is alive now! Use Anvil or Font, and swipe over him to hit.")
+			return
+		end
+		S.last = v
+		addStroke(v, v + Vector2.new(0.05, 0))
+	elseif tool == "select" then
+		trySelect(v)
+	elseif tool == "anvil" then
+		dropAnvil(v)
+	elseif tool == "font" then
+		dropFont(v)
+	end
+end
+
+setTool = function(name)
+	S.tool = name
+	for k, b in pairs(S.toolBtns) do
+		b.bg.Color = (k == name) and Color3.fromRGB(160, 205, 255) or Color3.fromRGB(232, 232, 238)
+	end
+	if name ~= "select" then
+		closePopup()
+	end
+	S.last = nil
+end
+
+----------------------------------------------------------------------
+-- Paint window
+----------------------------------------------------------------------
+openPaint = function()
+	if S.paint then return end
+	closeDummy()
+	local wx, wy = 120, 18
+	local ww, wh = W - 240, H - 18 - 36 - 8
+	local win = makeWindow("paint", wx, wy, ww, wh, Z_WIN, "Untitled 1 - Paint", 2, function() onPaintX() end)
+	S.paint = win
+	local f = win.folder
+	S.pf = f
+
+	mkText(wx + 8, wy + 26, ww - 16, 14, Z_WIN + 0.1, "File     Edit     View     Image     Colors", 9,
+		Color3.fromRGB(90, 90, 100), Enum.TextXAlignment.Left, f)
+	rect(wx, wy + 40, ww, 36, Z_WIN + 0.03, Color3.fromRGB(226, 228, 236), 0, f)
+
+	S.toolBtns = {}
+	local tl = { { "select", "Select" }, { "pencil", "Pencil" }, { "anvil", "Anvil" }, { "font", "Font" } }
+	for i, t in ipairs(tl) do
+		local b = makeButton { group = "paint", x = wx + 10 + (i - 1) * 62, y = wy + 44, w = 56, h = 28,
+			z = Z_WIN + 0.08, layer = 2, text = t[2], size = 11, parent = f,
+			onClick = function() setTool(t[1]) end }
+		S.toolBtns[t[1]] = b
+	end
+
+	local cx, cy = wx + 8, wy + 80
+	local cw, ch = ww - 16, wh - 80 - 24
+	rect(cx - 1, cy - 1, cw + 2, ch + 2, Z_CANVAS - 0.05, Color3.fromRGB(120, 120, 135), 0, f)
+	rect(cx, cy, cw, ch, Z_CANVAS, Color3.new(1, 1, 1), 0, f)
+	S.canvas = { x = cx, y = cy, w = cw, h = ch }
+	local _, hl = mkText(cx + 6, cy + 3, cw - 12, 16, Z_CANVAS + 0.1, "", 11,
+		Color3.fromRGB(110, 110, 120), Enum.TextXAlignment.Left, f)
+	S.hintLbl = hl
+
+	local sy = wy + wh - 20
+	rect(wx, sy, ww, 20, Z_WIN + 0.03, Color3.fromRGB(226, 228, 236), 0, f)
+	mkText(wx + 8, sy, 44, 20, Z_WIN + 0.1, "Mouse", 10, Color3.new(0, 0, 0), Enum.TextXAlignment.Left, f)
+	S.bm = { x = wx + 54, y = sy + 6, w = 110, h = 8 }
+	rect(S.bm.x, S.bm.y, S.bm.w, S.bm.h, Z_WIN + 0.06, Color3.fromRGB(150, 150, 160), 0, f)
+	S.bmFg = rect(S.bm.x, S.bm.y, S.bm.w, S.bm.h, Z_WIN + 0.1, Color3.fromRGB(60, 200, 90), 0, f)
+	mkText(wx + 180, sy, 54, 20, Z_WIN + 0.1, "Stickman", 10, Color3.new(0, 0, 0), Enum.TextXAlignment.Left, f)
+	S.bs = { x = wx + 236, y = sy + 6, w = 110, h = 8 }
+	rect(S.bs.x, S.bs.y, S.bs.w, S.bs.h, Z_WIN + 0.06, Color3.fromRGB(150, 150, 160), 0, f)
+	S.bsFg = rect(S.bs.x, S.bs.y, 1, S.bs.h, Z_WIN + 0.1, Color3.fromRGB(230, 70, 60), 0, f)
+	local _, ll = mkText(wx + ww - 300, sy, 292, 20, Z_WIN + 0.1, "", 10, Color3.new(0, 0, 0),
+		Enum.TextXAlignment.Right, f)
+	S.lockLbl = ll
+
+	S.strokes, S.darts, S.puddles, S.anvils, S.fonts, S.items = {}, {}, {}, {}, {}, {}
+	S.stick, S.eraser, S.popF, S.selF = nil, nil, nil, nil
+	S.curHP, S.crashT, S.curInv, S.lockLeft, S.unlockedMsg = 100, 0, 0, 30, false
+	S.taskLbl.Text = "🎨"
+	setTool("pencil")
+	setHint("Pencil: draw a stickman. Then pick Select and tap your drawing.")
+	refreshHover()
+end
+
+closePaint = function()
+	if not S.paint then return end
+	closePopup()
+	removeGroup("paint")
+	S.paint.folder:Destroy()
+	S.paint, S.pf, S.canvas, S.stick, S.eraser = nil, nil, nil, nil, nil
+	S.strokes, S.darts, S.puddles, S.anvils, S.fonts, S.items = {}, {}, {}, {}, {}, {}
+	S.hintLbl, S.lockLbl = nil, nil
+	S.last = nil
+	S.taskLbl.Text = ""
+	refreshHover()
+end
+
+onPaintX = function()
+	if S.modal or not S.paint then return end
+	if not S.stick then
+		closePaint()
+		return
+	end
+	if S.lockLeft > 0 then
+		S.xFlash = 0.5
+		setHint("The close button is locked... wait " .. math.ceil(S.lockLeft) .. "s.")
+		return
+	end
+	showSaveDialog()
+end
+
+----------------------------------------------------------------------
+-- "Save Changes To Untitled 1?"  (only NO works)
+----------------------------------------------------------------------
+showSaveDialog = function()
+	if S.modal then return end
+	closePopup()
+	S.modal = "dialog"
+	local f = Instance.new("Folder")
+	f.Name = "dialog"
+	f.Parent = root
+	S.dialogF = f
+	rect(-60, -60, W + 120, H + 120, Z_DIM, Color3.new(0, 0, 0), 0.55, f)
+	local w, h = 380, 140
+	local x, y = (W - w) / 2, (H - h) / 2 - 20
+	rect(x - 1, y - 1, w + 2, h + 2, Z_DLG - 0.05, Color3.fromRGB(40, 40, 50), 0, f)
+	rect(x, y, w, h, Z_DLG, Color3.fromRGB(240, 240, 245), 0, f)
+	rect(x, y, w, 26, Z_DLG + 0.03, Color3.new(1, 1, 1), 0, f)
+	mkText(x + 8, y, w - 16, 26, Z_DLG + 0.1, "Paint", 12, Color3.new(0, 0, 0), Enum.TextXAlignment.Left, f)
+	mkText(x + 20, y + 38, w - 40, 28, Z_DLG + 0.1, "Save Changes To Untitled 1?", 15,
+		Color3.new(0, 0, 0), Enum.TextXAlignment.Left, f)
+	local _, dh = mkText(x + 20, y + 68, w - 40, 18, Z_DLG + 0.1, "", 10, Color3.fromRGB(200, 30, 30),
+		Enum.TextXAlignment.Left, f)
+
+	local bw, bh = 100, 28
+	local bx = x + (w - (3 * bw + 20)) / 2
+	local by = y + h - 42
+	local gray = Color3.fromRGB(205, 205, 210)
+	local grayT = Color3.fromRGB(150, 150, 155)
+	makeButton { group = "dialog", x = bx, y = by, w = bw, h = bh, z = Z_DLG + 0.1, layer = 6,
+		text = "Yes", size = 12, bg = gray, tc = grayT, hlOn = 1, parent = f,
+		onClick = function() dh.Text = "Yes is broken. Only No works." end }
+	makeButton { group = "dialog", x = bx + bw + 10, y = by, w = bw, h = bh, z = Z_DLG + 0.1, layer = 6,
+		text = "No", size = 12, bg = Color3.fromRGB(190, 220, 255), hlOn = 0.4, parent = f,
+		onClick = function() destroyAll() end }
+	makeButton { group = "dialog", x = bx + 2 * (bw + 10), y = by, w = bw, h = bh, z = Z_DLG + 0.1, layer = 6,
+		text = "Cancel", size = 12, bg = gray, tc = grayT, hlOn = 1, parent = f,
+		onClick = function() dh.Text = "Cancel is broken too. Only No works." end }
+	refreshHover()
+end
+
+----------------------------------------------------------------------
+-- clean exit
+----------------------------------------------------------------------
+destroyAll = function()
+	for _, c in ipairs(conns) do
+		pcall(function() c:Disconnect() end)
+	end
+	conns = {}
+	pcall(function() root:Destroy() end)
+	pcall(function() gui:Destroy() end)
+	pcall(function()
+		cam.CFrame = oldCF
+		cam.FieldOfView = oldFov
+		cam.CameraType = (oldType == Enum.CameraType.Scriptable) and Enum.CameraType.Custom or oldType
+		if hum then
+			cam.CameraSubject = hum
+		end
+	end)
+	pcall(function()
+		UIS.MouseIconEnabled = oldIcon
+		if hum then
+			hum.WalkSpeed = oldWS
+			hum.JumpPower = oldJP
+			hum.JumpHeight = oldJH
+		end
+	end)
+	if _G.__PAINT_STICK and _G.__PAINT_STICK.destroy == destroyAll then
+		_G.__PAINT_STICK = nil
+	end
+end
+_G.__PAINT_STICK = { destroy = destroyAll }
+
+----------------------------------------------------------------------
+-- input (touch + mouse)
+----------------------------------------------------------------------
+local function toV(pos)
+	local ap, as = capture.AbsolutePosition, capture.AbsoluteSize
+	return Vector2.new(math.clamp((pos.X - ap.X) / as.X * W, 0, W), math.clamp((pos.Y - ap.Y) / as.Y * H, 0, H))
+end
+
+local function onDown(v)
+	if S.crashT > 0 and not S.modal then return end
+	setCursor(v.X, v.Y)
+	refreshHover()
+	local b = buttonAt(v.X, v.Y)
+	if b then
+		if b.onClick then b.onClick() end
+		return
+	end
+	if S.modal then return end
+	if S.popF then closePopup() end
+	if S.dummy and inRect(v, S.dummy) then return end
+	if S.paint and inCanvas(v) then
+		local st = S.stick
+		if st and not st.dead and st.sc >= 1 and stickHit(v) then
+			hurtStick(4, 0)
+		end
+		canvasDown(v)
+	end
+end
+
+local function onMove(v)
+	if S.crashT > 0 and not S.modal then return end
+	local old = Vector2.new(S.cx, S.cy)
+	setCursor(v.X, v.Y)
+	refreshHover()
+	if S.modal then return end
+	local st = S.stick
+	if st and S.paint and not st.dead and st.sc >= 1 and stickHit(v) then
+		hurtStick(math.clamp((v - old).Magnitude * 0.2, 0, 10), (st.x < v.X) and -2 or 2)
+	end
+	if S.down and S.paint and S.tool == "pencil" and not S.stick then
+		drawTo(v)
+	end
+end
+
+local function isPointer(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+bind(capture.InputBegan, function(input)
+	if not isPointer(input) then return end
+	S.active = input
+	S.activeType = input.UserInputType
+	S.down = true
+	onDown(toV(input.Position))
+end)
+
+bind(capture.InputChanged, function(input)
+	local ut = input.UserInputType
+	if ut == Enum.UserInputType.MouseMovement or (ut == Enum.UserInputType.Touch and input == S.active) then
+		onMove(toV(input.Position))
+	end
+end)
+
+bind(UIS.InputEnded, function(input)
+	if isPointer(input) and input.UserInputType == S.activeType
+		and (input == S.active or input.UserInputType == Enum.UserInputType.MouseButton1) then
+		S.down = false
+		S.active = nil
+		S.last = nil
+	end
+end)
+
+----------------------------------------------------------------------
+-- main loop
+----------------------------------------------------------------------
+bind(RunService.Heartbeat, function(dt)
+	dt = math.min(dt, 0.1)
+	local now = os.time()
+	if now ~= S.lastClock then
+		S.lastClock = now
+		S.clockLbl.Text = os.date("%I:%M %p") .. "\n" .. os.date("%m/%d/%Y")
+	end
+	if S.modal then return end
+	updateGame(dt)
+end)
+
+----------------------------------------------------------------------
+-- start
+----------------------------------------------------------------------
+buildDesktop()
+buildCursor()
+setCursor(W / 2, H / 2)
